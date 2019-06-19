@@ -1,0 +1,323 @@
+/*
+Copyright (c) 2019 mad-day
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+*/
+
+
+/*
+Vidshare-DB on Blockchain (prototype).
+*/
+package db
+
+import (
+	xdr "github.com/davecgh/go-xdr/xdr2"
+	"github.com/tendermint/iavl"
+	"github.com/tendermint/tendermint/abci/types"
+	"github.com/tendermint/tendermint/libs/common"
+	dbm "github.com/tendermint/tendermint/libs/db"
+	
+	"github.com/tendermint/tendermint/crypto/merkle"
+	
+	"github.com/mad-day/buildingblock/vidshare"
+	shell "github.com/ipfs/go-ipfs-api"
+	
+	"bytes"
+)
+
+const (
+	Code_OK uint32 = iota // 0
+	Code_MalformedTx
+	Code_Exists
+	Code_Invalid
+	Code_NotFound
+)
+const Codespace = "vidsharedb"
+
+type recordVerifier interface{
+	Verify(r *Record) (bool,error)
+}
+
+type verifier struct {
+	sh *shell.Shell
+}
+func (v *verifier) Verify(r *Record) (bool,error) {
+	_,err := vidshare.Decode(v.sh,vidshare.MakeCrypto(r.Key),r.Hash)
+	if err!=nil { return false,err }
+	
+	return true,nil
+}
+
+
+type irtree interface{
+	Get(key []byte) (index int64, value []byte)
+	Version() int64
+}
+type iwtree interface{
+	irtree
+	Set(key, value []byte) bool
+}
+
+type tempdb struct{
+	irtree
+	db dbm.DB
+}
+func (t *tempdb) Get(key []byte) (index int64, value []byte) {
+	if t.db.Has(key) {
+		value = t.db.Get(key)
+		index = t.Version()+1
+		return
+	}
+	return t.irtree.Get(key)
+}
+func (t *tempdb) Set(key, value []byte) bool {
+	t.db.Set(key,value)
+	return true
+}
+
+type Database struct {
+	types.BaseApplication
+	idb dbm.DB
+	tree *iavl.MutableTree
+	veri recordVerifier
+	Evs  chan <- Event // Subscribes to events.
+	tmp  iwtree
+	snap *iavl.ImmutableTree
+	info *types.ResponseInfo
+	nextHeight int64
+}
+var _ types.Application = (*Database)(nil)
+
+func MakeDatabase(idb dbm.DB, sh *shell.Shell) (*Database,error) {
+	return makeDatabase1(idb,&verifier{sh})
+}
+func makeDatabase1(idb dbm.DB, veri recordVerifier) (*Database,error) {
+	db := new(Database)
+	db.idb = idb
+	db.tree = iavl.NewMutableTree(idb,128)
+	version,_ := db.tree.Load()
+	db.veri = veri
+	
+	// Snapshot the latest version!
+	tree,_ := db.tree.GetImmutable(version)
+	
+	// If no snapshot is available, create an empty in-memory tree.
+	if tree==nil { tree = iavl.NewImmutableTree(nil,128) }
+	
+	db.snap = tree
+	db.tmp = &tempdb{tree,dbm.NewMemDB()}
+	
+	db.loadInfo()
+	return db,nil
+}
+
+const itsInfo = "!.info"
+func (db *Database) loadInfo() {
+	db.info = new(types.ResponseInfo)
+	if v := db.idb.Get([]byte(itsInfo)); len(v)!=0 {
+		if err := db.info.Unmarshal(v); err!=nil { panic(err) }
+	}
+}
+func (db *Database) storeInfo() {
+	if v,err := db.info.Marshal(); err!=nil {
+		panic(err)
+	} else {
+		db.idb.Set([]byte(itsInfo),v)
+	}
+}
+
+func (db *Database) EndBlock(r types.RequestEndBlock) types.ResponseEndBlock {
+	db.nextHeight = r.Height
+	return db.BaseApplication.EndBlock(r)
+}
+func (db *Database) Info(r types.RequestInfo) (resp types.ResponseInfo) {
+	if db.info!=nil { resp = *db.info }
+	resp.Version = "1.0.0"
+	resp.AppVersion = 1
+	return
+}
+
+func (db *Database) onEv(e Event) bool {
+	if db.Evs==nil { return false }
+	select {
+	case db.Evs <- e: return true
+	default: return false
+	}
+	panic("unreachable")
+}
+
+func (db *Database) CheckTx(tx []byte) types.ResponseCheckTx {
+	del := db.deliver(db.tmp,Ev_CheckTx,tx)
+	return types.ResponseCheckTx{
+		Code:      del.Code,
+		Data:      del.Data,
+		Log :      del.Log,
+		Info:      del.Info,
+		GasWanted: del.GasWanted,
+		GasUsed:   del.GasUsed,
+		Tags:      del.Tags,
+		Codespace: del.Codespace,
+	}
+}
+func (db *Database) DeliverTx(tx []byte) types.ResponseDeliverTx {
+	return db.deliver(db.tree,Ev_DeliverTx,tx)
+}
+func (db *Database) deliver(w iwtree,evt EventType,rtx []byte) types.ResponseDeliverTx {
+	tx := new(TxData)
+	if _,err := xdr.Unmarshal(bytes.NewReader(rtx),tx); err!=nil {
+		log := ""
+		if err!=nil { log = "Error: "+err.Error() }
+		return types.ResponseDeliverTx{
+			Code: Code_MalformedTx,
+			Log: log,
+		}
+	}
+	
+	_,v := w.Get([]byte(tx.Hash))
+	if len(v)!=0 {
+		return types.ResponseDeliverTx{Code: Code_Exists}
+	}
+	rec := tx.asRecord()
+	ok,err := db.veri.Verify(rec)
+	if !ok {
+		log := ""
+		if err!=nil { log = "Error: "+err.Error() }
+		return types.ResponseDeliverTx{
+			Code: Code_Invalid,
+			Log: log,
+		}
+	}
+	
+	data := rec.Bytes()
+	
+	w.Set([]byte(rec.Hash),data)
+	
+	log := ""
+	if !db.onEv(Event{Typ:evt,Rec:rec}) {
+		log = "Event missed: "+rec.Hash
+	}
+	
+	return types.ResponseDeliverTx{
+		Code: Code_OK,
+		Log: log,
+		GasWanted: 10,
+		GasUsed: 10,
+		Tags: []common.KVPair{
+			{Key:[]byte("ipfs.hash"),Value:[]byte(rec.Hash)},
+		},
+		Codespace: Codespace,
+	}
+}
+
+func (db *Database) Commit() types.ResponseCommit {
+	hash,version,err := db.tree.SaveVersion()
+	if err!=nil { panic(err) }
+	
+	// Snapshot the latest version!
+	tree,_ := db.tree.GetImmutable(version)
+	
+	// If no snapshot is available, create an empty in-memory tree.
+	if tree==nil { tree = iavl.NewImmutableTree(nil,128) }
+	
+	// set new snapshot.
+	db.snap = tree
+	
+	// Set a new TempDB
+	db.tmp = &tempdb{tree,dbm.NewMemDB()}
+	
+	db.info.LastBlockHeight = db.nextHeight
+	db.info.LastBlockAppHash = append([]byte{},hash...)
+	db.storeInfo()
+	
+	// Issue an Commit event.
+	db.onEv(Event{Typ:Ev_Commit})
+	
+	return types.ResponseCommit{Data:hash}
+}
+
+func (db *Database) storeQuery(q types.RequestQuery) (resp types.ResponseQuery) {
+	var val [] byte
+	key := q.Data
+	if q.Prove {
+		var p *iavl.RangeProof
+		var err error
+		
+		val,p,err = db.snap.GetWithProof(key)
+		if err!=nil { panic(err) }
+		
+		resp.Proof = new(merkle.Proof)
+		
+		if val==nil {
+			resp.Proof.Ops = []merkle.ProofOp{ iavl.NewIAVLAbsenceOp(key,p).ProofOp() }
+		} else {
+			resp.Proof.Ops = []merkle.ProofOp{ iavl.NewIAVLValueOp(key,p).ProofOp() }
+		}
+	} else {
+		_,val = db.snap.Get(key)
+	}
+	resp.Key = key
+	resp.Value = val
+	resp.Code = Code_NotFound
+	resp.Codespace = Codespace
+	return
+}
+func (db *Database) Query(q types.RequestQuery) types.ResponseQuery {
+	switch q.Path {
+	case "/store":
+		return db.storeQuery(q)
+	}
+	
+	return db.BaseApplication.Query(q)
+}
+
+
+type TxData struct {
+	Hash string // ipfs-hash
+	Key  []byte // encryption key
+}
+func (t *TxData) Bytes() []byte {
+	buf := new(bytes.Buffer)
+	_,err := xdr.Marshal(buf,t)
+	if err!=nil { panic(err) }
+	return buf.Bytes()
+}
+
+type Record TxData
+
+func (t *TxData) asRecord() *Record { return (*Record)(t) }
+
+func (t *Record) Bytes() []byte {
+	buf := new(bytes.Buffer)
+	_,err := xdr.Marshal(buf,t)
+	if err!=nil { panic(err) }
+	return buf.Bytes()
+}
+
+type EventType int
+const (
+	Ev_CheckTx EventType = iota
+	Ev_DeliverTx
+	Ev_Commit
+)
+
+type Event struct {
+	Typ  EventType
+	Rec  *Record
+}
+
