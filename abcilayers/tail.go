@@ -115,6 +115,12 @@ func (t *HashCounter) Commit() types.ResponseCommit {
 	t.h1 = t.h2
 	t.hash = t.digest.Sum(emptyTruncated())
 	
+	{
+		data,err := json.Marshal(info{Hash:t.hash,Heigth:t.h1})
+		if err!=nil { panic(err) }
+		t.DB.SetSync(infokey,data)
+	}
+	
 	t.newDigest()
 	
 	return types.ResponseCommit{Data:t.hash}
