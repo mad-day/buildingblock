@@ -50,6 +50,24 @@ var bcseedkey = []byte("bcseed")
 
 func emptyTruncated() []byte { return make([]byte,0,20) }
 
+/*
+An ABCI-application layer, that sets the .Version and .AppVersion fields in
+Info-responses to specified values.
+*/
+type AppMetadata struct {
+	types.Application
+	
+	// The fields to set in Info-Responses
+	Version string
+	AppVersion uint64
+}
+func (t *AppMetadata) Info(q types.RequestInfo) (a types.ResponseInfo) {
+	a = t.Application.Info(q)
+	a.Version = t.Version
+	a.AppVersion = t.AppVersion
+	return
+}
+
 
 /*
 An ABCI-application layer, that calculates a block-hash upon commit and implements
