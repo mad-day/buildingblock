@@ -45,7 +45,7 @@ type info struct {
 	Heigth int64
 }
 
-var infokey = []byte("info")
+var infokey   = []byte("info")
 var bcseedkey = []byte("bcseed")
 
 func emptyTruncated() []byte { return make([]byte,0,20) }
@@ -55,6 +55,12 @@ func emptyTruncated() []byte { return make([]byte,0,20) }
 An ABCI-application layer, that calculates a block-hash upon commit and implements
 the Info-method correctly (returning the latest Commit block height and app hash).
 It also hashes all transactions, that are successfully submitted through DeliverTx.
+
+The user MAY optionallysupply a value in the database with the key "bcseed". This
+is like a shared secret, that must be the same on each Blockchain-member.
+
+The layer manages a record with the key "info", which contains a JSON object holding
+the last Block-Height and the last App-Hash.
 */
 type HashCounter struct {
 	types.Application

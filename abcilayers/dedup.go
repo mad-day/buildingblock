@@ -75,6 +75,9 @@ so that maximum number of hash buckets is 2²⁴ (~ 16 millions).
 In the case of a hash collision in the truncated 24-bit hash space, the
 algorithm can fail to detect some duplicate TX-keys, but the algorithm
 guarantees, that no TX-keys are falsely detected as duplicates.
+
+The bucket numbers are formatted as hex with the "dedup" prefix, so that
+a key looks like "dedupF2A450".
 */
 type DedupLayer struct {
 	types.Application
